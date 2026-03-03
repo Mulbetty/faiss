@@ -257,11 +257,27 @@ __global__ void pqScanPrecomputedMultiPass(
     // Prevent WAR dependencies
     __syncthreads();
 
+    // Seed the prefetch pipeline: issue an L2 prefetch for the first
+    // iteration's "next" codes so they are in-flight while the initial
+    // LoadCode32 (above) and the __syncthreads are executing.
+    if (threadIdx.x + (idx_t)blockDim.x < limit) {
+        PrefetchCode32<NumSubQuantizers>::prefetch(
+                codeList, threadIdx.x + blockDim.x);
+    }
+
     // Each thread handles one code element in the list, with a
     // block-wide stride
     for (idx_t codeIndex = threadIdx.x; codeIndex < limit;
          codeIndex += blockDim.x) {
-        // Prefetch next codes
+        // Prefetch two iterations ahead so the next iteration's LoadCode32
+        // finds the data already resident in L2, hiding global memory latency.
+        if (codeIndex + 2 * (idx_t)blockDim.x < limit) {
+            PrefetchCode32<NumSubQuantizers>::prefetch(
+                    codeList, codeIndex + 2 * blockDim.x);
+        }
+
+        // Load next codes into the double-buffer (benefits from the prefetch
+        // issued in the previous iteration)
         if (codeIndex + blockDim.x < limit) {
             LoadCode32<NumSubQuantizers>::load(
                     nextCode32, codeList, codeIndex + blockDim.x);

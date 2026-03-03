@@ -35,6 +35,32 @@ inline __device__ unsigned int getByte(unsigned char v, int pos, int width) {
     return v;
 }
 
+#ifndef USE_AMD_ROCM
+// Issue a prefetch of the cache line containing ptr into the L2 cache.
+// Calling this several loop iterations before the corresponding LoadCode32
+// hides global memory latency by overlapping the fetch with computation.
+inline __device__ void prefetchGlobalL2(const void* ptr) {
+#if defined(__CUDA_ARCH__)
+    asm("prefetch.global.L2 [%0];" : : "l"(ptr));
+#endif
+}
+#endif // !USE_AMD_ROCM
+
+// Prefetch the code data that a subsequent LoadCode32<NumSubQuantizers>::load
+// call will consume.  Issue this one or more iterations before the load to
+// pipeline memory traffic with arithmetic.
+template <int NumSubQuantizers>
+struct PrefetchCode32 {
+    static inline __device__ void prefetch(uint8_t* p, int offset) {
+        p += offset * NumSubQuantizers;
+#ifndef USE_AMD_ROCM
+        prefetchGlobalL2(p);
+#else
+        __builtin_prefetch(p, 0, 1); // read prefetch, moderate temporal locality
+#endif
+    }
+};
+
 inline __device__ unsigned int getByte(unsigned short v, int pos, int width) {
     return getBitfield((unsigned int)v, pos, width);
 }
