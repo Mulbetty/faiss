@@ -238,6 +238,11 @@ __global__ void pqScanPrecomputedMultiPass(
 
     constexpr idx_t kNumCode32 =
             NumSubQuantizers <= 4 ? 1 : (NumSubQuantizers / 4);
+    // kBytesPerCode32: bytes consumed from each 32-bit word (loop-invariant)
+    constexpr int kBytesPerCode32 = NumSubQuantizers < 4 ? NumSubQuantizers : 4;
+    // Total number of sub-quantizer lookups per vector (== NumSubQuantizers)
+    constexpr int kTotalLookups = kNumCode32 * kBytesPerCode32;
+
     unsigned int code32[kNumCode32];
     unsigned int nextCode32[kNumCode32];
 
@@ -257,12 +262,27 @@ __global__ void pqScanPrecomputedMultiPass(
     // Prevent WAR dependencies
     __syncthreads();
 
-    // Seed the prefetch pipeline: issue an L2 prefetch for the first
-    // iteration's "next" codes so they are in-flight while the initial
+    // Seed the global-memory prefetch pipeline: issue an L2 prefetch for the
+    // first iteration's "next" codes so they are in-flight while the initial
     // LoadCode32 (above) and the __syncthreads are executing.
     if (threadIdx.x + (idx_t)blockDim.x < limit) {
         PrefetchCode32<NumSubQuantizers>::prefetch(
                 codeList, threadIdx.x + blockDim.x);
+    }
+
+    // Seed the shared-memory prefetch pipeline: decode code32 and load the
+    // corresponding term23 values into registers for the first iteration.
+    // This overlaps the smem reads with the __syncthreads / L2-prefetch above.
+    float prefetchedTerms[kTotalLookups];
+#pragma unroll
+    for (int word = 0; word < kNumCode32; ++word) {
+#pragma unroll
+        for (int byte = 0; byte < kBytesPerCode32; ++byte) {
+            int idx = word * kBytesPerCode32 + byte;
+            auto code = getByte(code32[word], byte * 8, 8);
+            auto offset = (idx_t)codesPerSubQuantizer * idx;
+            prefetchedTerms[idx] = ConvertTo<float>::to(term23[offset + code]);
+        }
     }
 
     // Each thread handles one code element in the list, with a
@@ -276,34 +296,43 @@ __global__ void pqScanPrecomputedMultiPass(
                     codeList, codeIndex + 2 * blockDim.x);
         }
 
-        // Load next codes into the double-buffer (benefits from the prefetch
+        // Load next codes into the double-buffer (benefits from the L2 prefetch
         // issued in the previous iteration)
         if (codeIndex + blockDim.x < limit) {
             LoadCode32<NumSubQuantizers>::load(
                     nextCode32, codeList, codeIndex + blockDim.x);
         }
 
-        float dist = term1;
-
+        // Pre-fetch shared-memory term23 values for the NEXT iteration into
+        // registers.  These smem reads are issued here, before the current
+        // iteration's accumulation loop, so they can be serviced in parallel
+        // with the arithmetic below (computation/memory overlap).
+        // When nextCode32 is out-of-bounds (last iteration), the values are
+        // unused; term23 accesses are always in-bounds (code 0-255 is valid).
+        float nextPrefetchedTerms[kTotalLookups];
 #pragma unroll
         for (int word = 0; word < kNumCode32; ++word) {
-            constexpr int kBytesPerCode32 =
-                    NumSubQuantizers < 4 ? NumSubQuantizers : 4;
-
-            if (kBytesPerCode32 == 1) {
-                auto code = code32[0];
-                dist = ConvertTo<float>::to(term23[code]);
-
-            } else {
 #pragma unroll
-                for (int byte = 0; byte < kBytesPerCode32; ++byte) {
-                    auto code = getByte(code32[word], byte * 8, 8);
+            for (int byte = 0; byte < kBytesPerCode32; ++byte) {
+                int idx = word * kBytesPerCode32 + byte;
+                auto code = getByte(nextCode32[word], byte * 8, 8);
+                auto offset = (idx_t)codesPerSubQuantizer * idx;
+                nextPrefetchedTerms[idx] =
+                        ConvertTo<float>::to(term23[offset + code]);
+            }
+        }
 
-                    auto offset = codesPerSubQuantizer *
-                            (word * kBytesPerCode32 + byte);
+        // Accumulate distance using register-resident term23 values.
+        // No shared-memory accesses in this hot arithmetic path.
+        float dist = term1;
 
-                    dist += ConvertTo<float>::to(term23[offset + code]);
-                }
+        if (kBytesPerCode32 == 1) {
+            // NumSubQuantizers == 1: single-lookup special case (assignment)
+            dist = prefetchedTerms[0];
+        } else {
+#pragma unroll
+            for (int i = 0; i < kTotalLookups; ++i) {
+                dist += prefetchedTerms[i];
             }
         }
 
@@ -312,10 +341,14 @@ __global__ void pqScanPrecomputedMultiPass(
         // memory traffic. Those are recovered in the final selection step.
         distanceOut[codeIndex] = dist;
 
-        // Rotate buffers
+        // Rotate buffers: advance both the code and the pre-fetched smem values
 #pragma unroll
         for (int word = 0; word < kNumCode32; ++word) {
             code32[word] = nextCode32[word];
+        }
+#pragma unroll
+        for (int i = 0; i < kTotalLookups; ++i) {
+            prefetchedTerms[i] = nextPrefetchedTerms[i];
         }
     }
 }
