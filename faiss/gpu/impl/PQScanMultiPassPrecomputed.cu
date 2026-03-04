@@ -200,6 +200,36 @@ inline __device__ void loadPrecomputedTerm(
     }
 }
 
+// Variant of loadPrecomputedTerm that writes shared memory with a per-
+// sub-quantizer padding of kSmemPadding entries.  Each sub-quantizer table
+// is written at stride paddedCodesPerSubQuantizer so that consecutive
+// sub-quantizer bases land at different LDS banks, eliminating the
+// systematic bank conflicts caused when all tables start at bank 0.
+//
+// Global memory reads are still linearly indexed (coalesced); only the
+// shared-memory write address uses the padded stride.
+template <typename LookupT>
+inline __device__ void loadPrecomputedTermPadded(
+        LookupT* smem,
+        LookupT* term2Start,
+        LookupT* term3Start,
+        int numCodes,
+        int codesPerSubQuantizer,
+        int paddedCodesPerSubQuantizer) {
+    // codesPerSubQuantizer is always a power of 2 in PQ (2^bitsPerSubQuantizer).
+    // Hoist the shift/mask equivalents out of the loop so the compiler emits
+    // cheap bitwise instructions rather than integer divide/modulo.
+    unsigned log2CpSQ = __builtin_ctz((unsigned)codesPerSubQuantizer);
+    int maskCpSQ = codesPerSubQuantizer - 1;
+
+    for (idx_t i = threadIdx.x; i < numCodes; i += blockDim.x) {
+        int subq = (int)(i >> log2CpSQ);
+        int code = (int)(i & maskCpSQ);
+        smem[(idx_t)subq * paddedCodesPerSubQuantizer + code] =
+                Math<LookupT>::add(term2Start[i], term3Start[i]);
+    }
+}
+
 template <int NumSubQuantizers, typename LookupT, typename LookupVecT>
 __global__ void pqScanPrecomputedMultiPass(
         Tensor<float, 2, true> queries,
@@ -221,6 +251,14 @@ __global__ void pqScanPrecomputedMultiPass(
     auto probeId = blockIdx.x;
     auto codesPerSubQuantizer = precompTerm2.getSize(2);
     auto precompTermSize = precompTerm2.getSize(1) * codesPerSubQuantizer;
+
+    // Padding added after each sub-quantizer's 256-entry table so that
+    // consecutive sub-quantizer bases land on different LDS banks.
+    // kSmemPadding entries of LookupT = exactly 4 bytes of padding, making
+    // the stride in 4-byte bank-words an odd number (coprime with 32), which
+    // eliminates the systematic 2-way bank conflicts observed in profiling.
+    constexpr int kSmemPadding = sizeof(float) / sizeof(LookupT);
+    auto paddedCodesPerSubQuantizer = codesPerSubQuantizer + kSmemPadding;
 
     // This is where we start writing out data
     // We ensure that before the array (at offset -1), there is a 0 value
@@ -251,13 +289,15 @@ __global__ void pqScanPrecomputedMultiPass(
         LoadCode32<NumSubQuantizers>::load(code32, codeList, threadIdx.x);
     }
 
-    // Load precomputed terms 1, 2, 3
+    // Load precomputed terms 1, 2, 3 into padded shared memory
     float term1 = precompTerm1[queryId][probeId];
-    loadPrecomputedTerm<LookupT, LookupVecT>(
+    loadPrecomputedTermPadded<LookupT>(
             term23,
             precompTerm2[listId].data(),
             precompTerm3[queryId].data(),
-            precompTermSize);
+            precompTermSize,
+            codesPerSubQuantizer,
+            paddedCodesPerSubQuantizer);
 
     // Prevent WAR dependencies
     __syncthreads();
@@ -280,7 +320,7 @@ __global__ void pqScanPrecomputedMultiPass(
         for (int byte = 0; byte < kBytesPerCode32; ++byte) {
             int idx = word * kBytesPerCode32 + byte;
             auto code = getByte(code32[word], byte * 8, 8);
-            auto offset = (idx_t)codesPerSubQuantizer * idx;
+            auto offset = (idx_t)paddedCodesPerSubQuantizer * idx;
             prefetchedTerms[idx] = ConvertTo<float>::to(term23[offset + code]);
         }
     }
@@ -316,7 +356,7 @@ __global__ void pqScanPrecomputedMultiPass(
             for (int byte = 0; byte < kBytesPerCode32; ++byte) {
                 int idx = word * kBytesPerCode32 + byte;
                 auto code = getByte(nextCode32[word], byte * 8, 8);
-                auto offset = (idx_t)codesPerSubQuantizer * idx;
+                auto offset = (idx_t)paddedCodesPerSubQuantizer * idx;
                 nextPrefetchedTerms[idx] =
                         ConvertTo<float>::to(term23[offset + code]);
             }
@@ -457,10 +497,18 @@ void runMultiPassTile(
         auto grid = dim3(ivfListIds.getSize(1), ivfListIds.getSize(0));
         auto block = dim3(kThreadsPerBlock);
 
-        // pq precomputed terms (2 + 3)
+        // pq precomputed terms (2 + 3), with per-sub-quantizer padding to
+        // eliminate LDS bank conflicts (see loadPrecomputedTermPadded and
+        // kernel's kSmemPadding = sizeof(float)/sizeof(LookupT)).
+        // Padding = sizeof(float)/sizeof(LookupT) entries per sub-quantizer
+        // makes the bank stride coprime with 32, breaking the systematic
+        // 2-way conflict pattern when all sub-Q tables start at bank 0.
+        //   half:  smemPadding=2, stride=258 entries=129 bank-words, gcd(129,32)=1
+        //   float: smemPadding=1, stride=257 entries=257 bank-words, gcd(257,32)=1
+        auto smemPadding = useFloat16Lookup ? 2 : 1; // = sizeof(float)/sizeof(LookupT)
         auto smem = useFloat16Lookup ? sizeof(half) : sizeof(float);
 
-        smem *= numSubQuantizers * numSubQuantizerCodes;
+        smem *= numSubQuantizers * (numSubQuantizerCodes + smemPadding);
         FAISS_ASSERT(smem <= getMaxSharedMemPerBlockCurrentDevice());
 
 #define RUN_PQ_OPT(NUM_SUB_Q, LOOKUP_T, LOOKUP_VEC_T)                 \
