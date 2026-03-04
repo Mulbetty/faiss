@@ -219,7 +219,9 @@ inline __device__ void loadPrecomputedTermPadded(
     // codesPerSubQuantizer is always a power of 2 in PQ (2^bitsPerSubQuantizer).
     // Hoist the shift/mask equivalents out of the loop so the compiler emits
     // cheap bitwise instructions rather than integer divide/modulo.
-    unsigned log2CpSQ = __builtin_ctz((unsigned)codesPerSubQuantizer);
+    // Use __ffs() (find first set bit, 1-indexed) instead of __builtin_ctz so
+    // the code works correctly as a HIP device intrinsic on ROCm as well.
+    int log2CpSQ = __ffs(codesPerSubQuantizer) - 1;
     int maskCpSQ = codesPerSubQuantizer - 1;
 
     for (idx_t i = threadIdx.x; i < numCodes; i += blockDim.x) {
@@ -365,15 +367,9 @@ __global__ void pqScanPrecomputedMultiPass(
         // Accumulate distance using register-resident term23 values.
         // No shared-memory accesses in this hot arithmetic path.
         float dist = term1;
-
-        if (kBytesPerCode32 == 1) {
-            // NumSubQuantizers == 1: single-lookup special case (assignment)
-            dist = prefetchedTerms[0];
-        } else {
 #pragma unroll
-            for (int i = 0; i < kTotalLookups; ++i) {
-                dist += prefetchedTerms[i];
-            }
+        for (int i = 0; i < kTotalLookups; ++i) {
+            dist += prefetchedTerms[i];
         }
 
         // Write out intermediate distance result
